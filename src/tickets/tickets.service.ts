@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -11,14 +12,18 @@ import { Ticket, TicketStatus } from './entities/ticket.entity';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { UpdateTicketDto } from './dto/update-ticket.dto';
 import { QueryTicketDto } from './dto/query-ticket.dto';
+import { TicketsCacheService } from './tickets-cache.service';
 
 @Injectable()
 export class TicketsService {
+  private readonly logger = new Logger(TicketsService.name);
+
   constructor(
     @InjectRepository(Ticket)
     private readonly ticketRepository: Repository<Ticket>,
     @InjectQueue('tickets')
     private readonly ticketQueue: Queue,
+    private readonly cacheService: TicketsCacheService,
   ) {}
 
   async create(createTicketDto: CreateTicketDto) {
@@ -26,11 +31,13 @@ export class TicketsService {
       const ticket = this.ticketRepository.create(createTicketDto);
       const savedTicket = await this.ticketRepository.save(ticket);
 
+      await this.cacheService.invalidateAllLists();
+
       await this.ticketQueue.add(
         'notify',
-        { ticketId: savedTicket.id },
+        { ticket: savedTicket },
         {
-          jobId: `notify:${savedTicket.id}`,
+          jobId: `notify_${savedTicket.id}`,
           attempts: 3,
           backoff: {
             type: 'exponential',
@@ -41,21 +48,28 @@ export class TicketsService {
 
       await this.ticketQueue.add(
         'sla-check',
-        { ticketId: savedTicket.id },
+        { ticket: savedTicket },
         {
-          jobId: `sla:${savedTicket.id}`,
+          jobId: `sla_${savedTicket.id}`,
           delay: 15 * 60 * 1000,
         },
       );
 
+      this.logger.log(`Created ticket: ${savedTicket.id}`);
       return savedTicket;
     } catch (error) {
+      this.logger.error(`Failed to create ticket: ${error.message}`, error.stack);
       throw new InternalServerErrorException('Failed to create ticket');
     }
   }
 
   async findAll(queryDto: QueryTicketDto) {
     try {
+      const cachedResult = await this.cacheService.getTicketList(queryDto);
+      if (cachedResult) {
+        return cachedResult;
+      }
+
       const {
         status,
         priority,
@@ -95,12 +109,13 @@ export class TicketsService {
         : 'createdAt';
       queryBuilder.orderBy(`ticket.${sortField}`, sortOrder);
 
+      // Apply pagination
       const skip = (page - 1) * pageSize;
       queryBuilder.skip(skip).take(pageSize);
 
       const [data, total] = await queryBuilder.getManyAndCount();
 
-      return {
+      const result = {
         data,
         meta: {
           total,
@@ -109,19 +124,32 @@ export class TicketsService {
           totalPages: Math.ceil(total / pageSize),
         },
       };
+
+      await this.cacheService.setTicketList(queryDto, result);
+
+      return result;
     } catch (error) {
+      this.logger.error(`Failed to fetch tickets: ${error.message}`, error.stack);
       throw new InternalServerErrorException('Failed to fetch tickets');
     }
   }
 
   async findOne(id: string) {
-    const ticket = await this.ticketRepository.findOne({ where: { id } });
+    try {
+      const ticket = await this.cacheService.getOrFetch(id);
 
-    if (!ticket) {
-      throw new NotFoundException(`Ticket with ID "${id}" not found`);
+      if (!ticket) {
+        throw new NotFoundException(`Ticket with ID "${id}" not found`);
+      }
+
+      return ticket;
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      this.logger.error(`Failed to fetch ticket ${id}: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Failed to fetch ticket');
     }
-
-    return ticket;
   }
 
   async update(id: string, updateTicketDto: UpdateTicketDto) {
@@ -132,6 +160,9 @@ export class TicketsService {
       Object.assign(ticket, updateTicketDto);
       const updatedTicket = await this.ticketRepository.save(ticket);
 
+      await this.cacheService.invalidateTicket(id);
+      await this.cacheService.invalidateAllLists();
+
       if (
         updateTicketDto.status === TicketStatus.RESOLVED &&
         oldStatus !== TicketStatus.RESOLVED
@@ -139,8 +170,10 @@ export class TicketsService {
         await this.removeSlaJob(id);
       }
 
+      this.logger.log(`Updated ticket: ${id}`);
       return updatedTicket;
     } catch (error) {
+      this.logger.error(`Failed to update ticket ${id}: ${error.message}`, error.stack);
       throw new InternalServerErrorException('Failed to update ticket');
     }
   }
@@ -150,12 +183,18 @@ export class TicketsService {
 
     try {
       await this.ticketRepository.remove(ticket);
+
+      await this.cacheService.invalidateTicket(id);
+      await this.cacheService.invalidateAllLists();
+
       await this.removeSlaJob(id);
 
+      this.logger.log(`Deleted ticket: ${id}`);
       return {
         message: `Ticket with ID "${id}" has been successfully deleted`,
       };
     } catch (error) {
+      this.logger.error(`Failed to delete ticket ${id}: ${error.message}`, error.stack);
       throw new InternalServerErrorException('Failed to delete ticket');
     }
   }
@@ -165,10 +204,13 @@ export class TicketsService {
       const job = await this.ticketQueue.getJob(`sla:${ticketId}`);
       if (job) {
         await job.remove();
-        console.log(`Removed SLA job for ticket: ${ticketId}`);
+        this.logger.debug(`Removed SLA job for ticket: ${ticketId}`);
       }
     } catch (error) {
-      console.error(`Failed to remove SLA job for ticket ${ticketId}:`, error);
+      this.logger.error(
+        `Failed to remove SLA job for ticket ${ticketId}: ${error.message}`,
+        error.stack,
+      );
     }
   }
 }
